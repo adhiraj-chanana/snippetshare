@@ -2,6 +2,8 @@ import * as vscode from "vscode";
 import { createSnippetCommand } from "./commands/createSnippet";
 import { SnippetPanel } from "./webviews/SnippetPanel";
 import { fetchWorkspaces } from "./utils/api";
+import { setToken, clearToken } from './utils/auth';
+
 
 // 🔑 Temporary token store (global)
 export let firebaseToken: string | undefined;
@@ -22,6 +24,21 @@ export function getFirebaseToken(): string | undefined {
 
 export function activate(context: vscode.ExtensionContext) {
   console.log("🎉 SnippetShare extension is now active!");
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("snippetshare.handleAuth", (token: string) => {
+      setToken(token);
+      vscode.window.showInformationMessage("✅ Logged in successfully");
+    })
+  );
+  
+  context.subscriptions.push(
+    vscode.commands.registerCommand("snippetshare.handleLogout", () => {
+      clearToken();
+      vscode.window.showInformationMessage("👋 Logged out");
+    })
+  );
+  
 
   // Register create snippet command (Ctrl/Cmd + Alt + S)
   context.subscriptions.push(
