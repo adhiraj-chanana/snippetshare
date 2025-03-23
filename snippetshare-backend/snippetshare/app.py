@@ -3,9 +3,8 @@ from firebase_admin_setup import db
 from firebase_admin import auth as firebase_auth, firestore
 from functools import wraps
 import datetime
+from gemini import clean_snippet_with_gemini
 from flask_cors import CORS
-
-
 
 app = Flask(__name__)
 CORS(app)  # <-- Allow all origins (or customize)
@@ -27,42 +26,6 @@ def firebase_token_required(f):
 
         return f(*args, **kwargs)
     return decorated_function
-
-#Signup User
-@app.route('/signup', methods=['POST'])
-def signup():
-    data = request.get_json()
-    email = data.get('email')
-    password = data.get('password')
-
-    if not email or not password:
-        return jsonify({'error': 'Email and password are required'}), 400
-
-    try:
-        user_record = firebase_auth.create_user(email=email, password=password)
-        return jsonify({'uid': user_record.uid}), 201
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-    
-#Login user
-@app.route('/login', methods=['POST'])
-def login():
-    data = request.get_json()
-    email = data.get('email')
-    password = data.get('password')
-
-    if not email or not password:
-        return jsonify({'error': 'Email and password are required'}), 400
-
-    try:
-        # Optional: Just verify user exists, since Admin SDK does not check passwords
-        user_record = firebase_auth.get_user_by_email(email)
-        # You might later issue a custom token here if needed
-        return jsonify({'uid': user_record.uid}), 200
-    except firebase_auth.UserNotFoundError:
-        return jsonify({'error': 'User not found'}), 404
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
 
 
 
@@ -126,7 +89,8 @@ def get_workspaces():
     return jsonify(result), 200
 
 
-# Get Snippets in a workspace
+
+# Get all snippets for a workspace
 @app.route("/api/snippets", methods=["GET"])
 @firebase_token_required
 def get_snippets():
@@ -136,7 +100,7 @@ def get_snippets():
     if not workspace_id:
         return jsonify({"error": "workspace query param is required"}), 400
 
-    # Verify user is a member of the workspace
+    # Verify the user is a member of the workspace
     workspace_ref = db.collection("workspaces").document(workspace_id)
     workspace_doc = workspace_ref.get()
     if not workspace_doc.exists:
@@ -149,80 +113,61 @@ def get_snippets():
     # Fetch all snippets in this workspace
     snippets_ref = db.collection("snippets").where("workspaceId", "==", workspace_id)
     snippets = snippets_ref.stream()
-
-    result = []
-    uids_to_lookup = set()
-    snippets_list = []
-
-    for snap in snippets:
-        snippet_data = snap.to_dict()
-        created_by = snippet_data.get("createdBy")
-
-        # Ensure we always extract just the uid string
-        if isinstance(created_by, dict):
-            created_by_uid = created_by.get("uid")
-        elif isinstance(created_by, str):
-            created_by_uid = created_by
-        else:
-            created_by_uid = None
-
-        if created_by_uid:
-            uids_to_lookup.add(created_by_uid)
-
-        snippet_data["__created_by_uid"] = created_by_uid
-        snippets_list.append(snippet_data)
-
-    # Batch fetch all user emails via Firebase Admin
-    user_records = {}
-    if uids_to_lookup:
-        for uid in uids_to_lookup:
-            try:
-                user = firebase_auth.get_user(uid)
-                user_records[uid] = user.email
-            except Exception as e:
-                user_records[uid] = "unknown@user"
-
-    # Replace UID with email
-    for snippet in snippets_list:
-        uid = snippet.get("__created_by_uid")
-        snippet["createdBy"] = user_records.get(uid, "unknown@user")
-        snippet.pop("__created_by_uid", None)
-        result.append(snippet)
+    result = [snippet.to_dict() for snippet in snippets]
 
     return jsonify(result), 200
 
 
-# Create a snippet
+# Create a snippet in a workspace
 @app.route("/api/snippets", methods=["POST"])
 @firebase_token_required
 def create_snippet():
-    user_uid = request.user["uid"]
-
     data = request.get_json()
-    required_fields = ["title", "code", "workspaceId", "workspaceName"]
+    workspace_name = data.get("workspaceName")  # Expecting workspace name from the request
+    title = data.get("title")
+    tags = data.get("tags", [])
+    language = data.get("language")
+    code = data.get("code")
+    code = data.get("code")
+    code = clean_snippet_with_gemini(code)  # ⬅️ Add this line
+    
+    # Validate required fields
+    if not workspace_name:
+        return jsonify({"error": "Workspace name is required"}), 400
+    if not title or not code:
+        return jsonify({"error": "Title and code are required"}), 400
 
-    # Basic validation
-    for field in required_fields:
-        if not data.get(field):
-            return jsonify({"error": f"{field} is required"}), 400
+    # Query Firestore for the workspace with the given name
+    # and ensure the authenticated user is a member.
+    workspaces_query = db.collection("workspaces").where("name", "==", workspace_name)
+    workspace_doc = None
+    for ws in workspaces_query.stream():
+        ws_data = ws.to_dict()
+        if request.user["uid"] in ws_data.get("members", []):
+            workspace_doc = ws
+            break
 
-    snippet = {
-        "title": data.get("title").strip(),
-        "code": data.get("code"),
-        "tags": data.get("tags") or [],
-        "workspaceId": data.get("workspaceId"),
-        "workspaceName": data.get("workspaceName"),
-        "createdBy": user_uid,  # Only store UID here ✅
-        "createdAt": firestore.SERVER_TIMESTAMP,
+    if not workspace_doc:
+        return jsonify({"error": "Workspace not found or you are not a member"}), 404
+
+    # Use the workspace's document ID as the association
+    workspace_id = workspace_doc.id
+
+    # Create snippet data payload
+    snippet_data = {
+        "workspaceId": workspace_id,
+        "title": title,
+        "tags": tags,
+        "language": language,
+        "code": code,
+        "createdBy": request.user.get("uid"),
+        "createdAt": firestore.SERVER_TIMESTAMP
     }
-
     doc_ref = db.collection("snippets").document()
-    snippet["snippetId"] = doc_ref.id
-    doc_ref.set(snippet)
+    snippet_data["snippetId"] = doc_ref.id
+    doc_ref.set(snippet_data)
 
-    return jsonify({"message": "Snippet created!", "snippetId": doc_ref.id}), 201
-
-
+    return jsonify({"snippetId": doc_ref.id}), 201
 
 #Add Member to Workspace
 @app.route("/api/workspaces/<workspace_id>/members/add", methods=["POST"])
@@ -304,7 +249,8 @@ def remove_workspace_members(workspace_id):
     }), 200
 
 
-#Delete Snippet
+
+# Delete Snippet
 @app.route("/api/snippets/<snippet_id>", methods=["DELETE"])
 @firebase_token_required
 def delete_snippet(snippet_id):
@@ -317,8 +263,7 @@ def delete_snippet(snippet_id):
     snippet_data = snippet_doc.to_dict()
     
     # Check that the user requesting deletion is the creator of the snippet
-    created_by = snippet_data.get("createdBy", {})
-    if created_by.get("uid") != request.user["uid"]:
+    if snippet_data.get("createdBy") != request.user["uid"]:
         return jsonify({"error": "Not authorized to delete this snippet"}), 403
 
     # Delete the snippet document from Firestore
@@ -328,8 +273,7 @@ def delete_snippet(snippet_id):
 
 
 
-
-# Update Snippet
+#Update Snippet
 @app.route("/api/snippets/<snippet_id>", methods=["PUT"])
 @firebase_token_required
 def update_snippet(snippet_id):
@@ -358,14 +302,12 @@ def update_snippet(snippet_id):
     snippet_data = snippet_doc.to_dict()
 
     # Check if the requesting user is the creator of the snippet
-    created_by = snippet_data.get("createdBy", {})
-    if created_by.get("uid") != request.user["uid"]:
+    if snippet_data.get("createdBy") != request.user["uid"]:
         return jsonify({"error": "Not authorized to update this snippet"}), 403
 
     # Update the snippet with new fields
     snippet_ref.update(updated_fields)
     return jsonify({"message": "Snippet updated successfully", "snippetId": snippet_id}), 200
-
 
 
 #Delete a Workspace
@@ -405,58 +347,54 @@ def delete_workspace(workspace_id):
 def search_snippets():
     user_uid = request.user["uid"]
     workspace_id = request.args.get('workspace')
-    search_query = request.args.get('query', "").lower()
+    search_query = request.args.get('query', "").lower()  # Mandatory query for title search
+    language_filter = request.args.get('language', None)   # Optional
+    tags_filter = request.args.get('tags', None)           # Optional (comma-separated)
 
-    # verify membership, etc. omitted for brevity
+    # Ensure mandatory parameters are provided
+    if not workspace_id or not search_query:
+        return jsonify({"error": "Both 'workspace' and 'query' parameters are required"}), 400
 
+    # Verify the user is a member of the workspace
+    workspace_ref = db.collection("workspaces").document(workspace_id)
+    workspace_doc = workspace_ref.get()
+    if not workspace_doc.exists:
+        return jsonify({"error": "Workspace not found"}), 404
+
+    workspace_data = workspace_doc.to_dict()
+    if user_uid not in workspace_data.get("members", []):
+        return jsonify({"error": "Access denied - not a workspace member"}), 403
+
+    # Query for all snippets in the workspace
     snippets_ref = db.collection("snippets").where("workspaceId", "==", workspace_id)
-    snapshots = snippets_ref.stream()
+    snippets = snippets_ref.stream()
 
-    # We'll store matching snippet docs first
-    matching_snippets = []
-    uids_to_lookup = set()
+    result = []
+    for snippet in snippets:
+        snippet_data = snippet.to_dict()
+        # Filter by search query in title (case-insensitive)
+        title = snippet_data.get("title", "").lower()
+        if search_query not in title:
+            continue
 
-    for snap in snapshots:
-        snippet_data = snap.to_dict()
+        # Filter by language if provided
+        if language_filter:
+            if snippet_data.get("language", "").lower() != language_filter.lower():
+                continue
 
-        # 1) do your search filter checks
-        title_str = snippet_data.get("title", "").lower()
-        code_str = snippet_data.get("code", "").lower()
-        tags_str = " ".join(t.lower() for t in snippet_data.get("tags", []))
+        # Filter by tags if provided
+        if tags_filter:
+            required_tags = [tag.strip().lower() for tag in tags_filter.split(",")]
+            snippet_tags = [tag.lower() for tag in snippet_data.get("tags", [])]
+            if not all(tag in snippet_tags for tag in required_tags):
+                continue
 
-        if (search_query in title_str) or (search_query in code_str) or (search_query in tags_str):
-            # 2) keep track of createdBy for user lookup
-            created_by = snippet_data.get("createdBy")
-            if isinstance(created_by, str):
-                uids_to_lookup.add(created_by)
+        result.append(snippet_data)
 
-            # or if created_by is a dict, do similarly
-            snippet_data.setdefault("snippetId", snap.id)
-            matching_snippets.append(snippet_data)
-
-    # 3) Now batch fetch user emails
-    user_records = {}
-    for uid in uids_to_lookup:
-        try:
-            user_record = firebase_auth.get_user(uid)
-            user_records[uid] = user_record.email
-        except:
-            user_records[uid] = "unknown@user"
-
-    # 4) Replace createdBy with email
-    results = []
-    for snippet_data in matching_snippets:
-        created_by = snippet_data.get("createdBy")
-        if isinstance(created_by, str):
-            snippet_data["createdBy"] = user_records.get(created_by, "unknown@user")
-        results.append(snippet_data)
-
-    return jsonify(results), 200
+    return jsonify(result), 200
 
 
-
-
-# Get Snippet by ID
+#Get Snippet by ID
 @app.route("/api/snippets/<snippet_id>", methods=["GET"])
 @firebase_token_required
 def get_snippet(snippet_id):
@@ -484,10 +422,8 @@ def get_snippet(snippet_id):
     if request.user["uid"] not in workspace_data.get("members", []):
         return jsonify({"error": "Access denied - you are not a member of the workspace"}), 403
 
-    # No modification needed to snippet_data; it already contains { uid, email } for createdBy now
-
+    # If everything is good, return the snippet data
     return jsonify(snippet_data), 200
-
 
 
 # 🔵 Root health check
@@ -497,3 +433,4 @@ def index():
 
 if __name__ == "__main__":
     app.run(debug=True, port=8000)
+
